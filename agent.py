@@ -1,11 +1,18 @@
-import asyncio
 import subprocess
 import threading
 import queue
 import time
+import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 class TaskPriority(Enum):
@@ -95,24 +102,25 @@ Command:"""
 
 
 class ExecutionLayer:
-    def __init__(self, use_llm: bool = False):
+    def __init__(self, use_llm: bool = False, command_timeout: int = 300):
         self.active_processes: Dict[str, subprocess.Popen] = {}
         self.llm_integration = LLMIntegration() if use_llm else None
+        self.command_timeout = command_timeout
         
     def execute_command(self, task: Task) -> tuple[bool, str, str, str]:
         """Execute a terminal command and return (success, stdout, stderr, executed_command)"""
         try:
             # If this is a natural language task and we have LLM integration
             if task.natural_language and self.llm_integration:
-                print(f"Processing natural language: '{task.natural_language}'")
+                logger.info(f"Processing natural language: '{task.natural_language}'")
                 generated_command, explanation = self.llm_integration.generate_command(task.natural_language)
-                print(f"Generated command: {generated_command}")
-                print(f"Explanation: {explanation}")
+                logger.info(f"Generated command: {generated_command}")
+                logger.info(f"Explanation: {explanation}")
                 command_to_execute = generated_command
             else:
                 command_to_execute = task.command
-                
-            print(f"Executing: {command_to_execute}")
+
+            logger.info(f"Executing: {command_to_execute}")
             process = subprocess.Popen(
                 command_to_execute,
                 shell=True,
@@ -122,8 +130,8 @@ class ExecutionLayer:
             )
             
             self.active_processes[task.id] = process
-            
-            stdout, stderr = process.communicate()
+
+            stdout, stderr = process.communicate(timeout=self.command_timeout)
             success = process.returncode == 0
             
             # Clean up
@@ -132,9 +140,16 @@ class ExecutionLayer:
                 
             return success, stdout, stderr, command_to_execute
             
-        except Exception as e:
+        except subprocess.TimeoutExpired as e:
+            if task.id in self.active_processes:
+                self.active_processes[task.id].kill()
+                del self.active_processes[task.id]
+            logger.error(f"Command timed out for task {task.id}: {e}")
+            return False, "", f"Command timed out after {self.command_timeout} seconds", command_to_execute
+        except (OSError, subprocess.SubprocessError) as e:
             if task.id in self.active_processes:
                 del self.active_processes[task.id]
+            logger.error(f"Command execution failed for task {task.id}: {e}")
             return False, "", str(e), task.command
             
     def kill_task(self, task_id: str) -> bool:
@@ -144,20 +159,21 @@ class ExecutionLayer:
                 self.active_processes[task_id].terminate()
                 del self.active_processes[task_id]
                 return True
-            except:
-                pass
+            except (ProcessLookupError, OSError) as e:
+                logger.warning(f"Failed to kill task {task_id}: {e}")
         return False
 
 
 class SimpleAgent:
-    def __init__(self, use_llm: bool = False):
+    def __init__(self, use_llm: bool = False, command_timeout: int = 300):
         self.lanes: Dict[str, LaneQueue] = {}
-        self.execution_layer = ExecutionLayer(use_llm=use_llm)
+        self.execution_layer = ExecutionLayer(use_llm=use_llm, command_timeout=command_timeout)
         self.running = False
         self.task_counter = 0
         self.results: Dict[str, Dict] = {}
         self.use_llm = use_llm
-        
+        self.results_lock = threading.Lock()
+
         # Create default lane
         self.add_lane("default", max_concurrent=2)
         self.add_lane("high_priority", max_concurrent=1)
@@ -185,7 +201,7 @@ class SimpleAgent:
         )
         
         self.lanes[lane].add_task(task)
-        print(f"Task {task_id} queued in lane '{lane}' with priority {priority.name}")
+        logger.info(f"Task {task_id} queued in lane '{lane}' with priority {priority.name}")
         return task_id
         
     def submit_natural_language_task(self, natural_language: str, 
@@ -213,8 +229,8 @@ class SimpleAgent:
         )
         
         self.lanes[lane].add_task(task)
-        print(f"Natural language task {task_id} queued in lane '{lane}' with priority {priority.name}")
-        print(f"  Request: '{natural_language}'")
+        logger.info(f"Natural language task {task_id} queued in lane '{lane}' with priority {priority.name}")
+        logger.info(f"  Request: '{natural_language}'")
         return task_id
         
     def get_task_status(self, task_id: str) -> Optional[Dict]:
@@ -248,23 +264,24 @@ class SimpleAgent:
                         result_data['natural_language'] = task.natural_language
                         result_data['llm_generated'] = True
                     
-                    self.results[task.id] = result_data
-                    
+                    with self.results_lock:
+                        self.results[task.id] = result_data
+
                     lane.task_completed(success)
-                    
-                    print(f"Task {task.id} completed: {'SUCCESS' if success else 'FAILED'}")
+
+                    logger.info(f"Task {task.id} completed: {'SUCCESS' if success else 'FAILED'}")
                     
             time.sleep(0.1)  # Small delay to prevent busy waiting
             
     def start(self):
         """Start the agent loop"""
         if self.running:
-            print("Agent is already running")
+            logger.warning("Agent is already running")
             return
-            
+
         self.running = True
-        print("Starting Simple Agent...")
-        
+        logger.info("Starting Simple Agent...")
+
         # Start a thread for each lane
         self.threads = []
         for lane in self.lanes.values():
@@ -272,27 +289,27 @@ class SimpleAgent:
             thread.daemon = True
             thread.start()
             self.threads.append(thread)
-            
-        print(f"Agent started with {len(self.lanes)} lanes")
+
+        logger.info(f"Agent started with {len(self.lanes)} lanes")
         
     def stop(self):
         """Stop the agent loop"""
         if not self.running:
-            print("Agent is not running")
+            logger.warning("Agent is not running")
             return
-            
-        print("Stopping Simple Agent...")
+
+        logger.info("Stopping Simple Agent...")
         self.running = False
-        
+
         # Wait for threads to finish
         for thread in self.threads:
             thread.join(timeout=1)
-            
+
         # Kill any remaining processes
         for task_id in list(self.execution_layer.active_processes.keys()):
             self.execution_layer.kill_task(task_id)
-            
-        print("Agent stopped")
+
+        logger.info("Agent stopped")
         
     def get_stats(self) -> Dict:
         """Get agent statistics"""
@@ -349,7 +366,7 @@ def API_CALL(prompt: str) -> str:
 
 if __name__ == "__main__":
     # Example usage
-    print("=== Standard Agent Example ===")
+    logger.info("=== Standard Agent Example ===")
     agent = SimpleAgent()
     
     try:
@@ -366,30 +383,30 @@ if __name__ == "__main__":
         time.sleep(5)
         
         # Print stats
-        print("\n=== Agent Stats ===")
+        logger.info("\n=== Agent Stats ===")
         stats = agent.get_stats()
         for lane_name, lane_stats in stats['lanes'].items():
-            print(f"Lane '{lane_name}': {lane_stats}")
-            
+            logger.info(f"Lane '{lane_name}': {lane_stats}")
+
         # Print task results
-        print("\n=== Task Results ===")
+        logger.info("\n=== Task Results ===")
         for task_id, result in agent.results.items():
-            print(f"\nTask {task_id}:")
-            print(f"  Command: {result['command']}")
-            print(f"  Success: {result['success']}")
-            print(f"  Output: {result['stdout'].strip()}")
+            logger.info(f"\nTask {task_id}:")
+            logger.info(f"  Command: {result['command']}")
+            logger.info(f"  Success: {result['success']}")
+            logger.info(f"  Output: {result['stdout'].strip()}")
             if result['stderr']:
-                print(f"  Error: {result['stderr'].strip()}")
+                logger.info(f"  Error: {result['stderr'].strip()}")
                 
     except KeyboardInterrupt:
-        print("\nReceived interrupt signal...")
+        logger.warning("\nReceived interrupt signal...")
     finally:
         agent.stop()
-        
+
     # Wait a bit before starting LLM example
     time.sleep(1)
-    
-    print("\n\n=== LLM-Enabled Agent Example ===")
+
+    logger.info("\n\n=== LLM-Enabled Agent Example ===")
     llm_agent = SimpleAgent(use_llm=True)
     
     try:
@@ -406,23 +423,23 @@ if __name__ == "__main__":
         time.sleep(5)
         
         # Print stats
-        print("\n=== LLM Agent Stats ===")
+        logger.info("\n=== LLM Agent Stats ===")
         stats = llm_agent.get_stats()
         for lane_name, lane_stats in stats['lanes'].items():
-            print(f"Lane '{lane_name}': {lane_stats}")
-            
+            logger.info(f"Lane '{lane_name}': {lane_stats}")
+
         # Print task results
-        print("\n=== LLM Task Results ===")
+        logger.info("\n=== LLM Task Results ===")
         for task_id, result in llm_agent.results.items():
-            print(f"\nTask {task_id}:")
+            logger.info(f"\nTask {task_id}:")
             if result.get('natural_language'):
-                print(f"  Natural Language: {result['natural_language']}")
-                print(f"  LLM Generated: {result.get('llm_generated', False)}")
-            print(f"  Command: {result['command']}")
-            print(f"  Success: {result['success']}")
-            print(f"  Output: {result['stdout'].strip()}")
+                logger.info(f"  Natural Language: {result['natural_language']}")
+                logger.info(f"  LLM Generated: {result.get('llm_generated', False)}")
+            logger.info(f"  Command: {result['command']}")
+            logger.info(f"  Success: {result['success']}")
+            logger.info(f"  Output: {result['stdout'].strip()}")
             if result['stderr']:
-                print(f"  Error: {result['stderr'].strip()}")
+                logger.info(f"  Error: {result['stderr'].strip()}")
                 
     except KeyboardInterrupt:
         print("\nReceived interrupt signal...")

@@ -1,0 +1,10 @@
+# Core dependencies (none - uses Python standard library)
+
+# Optional dependencies for LLM integration
+# Uncomment if you want to use OpenAI:
+# openai>=1.0.0
+
+# Optional dependencies for other LLM providers
+# Uncomment as needed:
+# anthropic>=0.18.0
+# google-generativeai>=0.3.0
